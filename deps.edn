@@ -1,12 +1,17 @@
-{:paths   ["src/main" "resources"]
+{:paths   ["src/main" "resources" "src/dev"] ; POD "src/dev" temporary
  :deps    {com.cemerick/url         {:mvn/version "0.1.1"}
            com.taoensso/timbre      {:mvn/version "5.1.2"}
+           io.replikativ/datahike   {:mvn/version "0.3.6"} 
            metosin/malli            {:mvn/version "0.5.1"}
            mount/mount              {:mvn/version "0.1.16"}
            org.clojure/clojure      {:mvn/version "1.10.3"}
-           org.clojure/data.xml     {:mvn/version "0.2.0-alpha6"}}
+           org.clojure/data.xml     {:mvn/version "0.2.0-alpha6"}
 
- :aliases {:dev  {:extra-paths ["src/test"]
+           ;; The following are temporary. I need to get -A:dev to work!
+           expound/expound             {:mvn/version "0.8.9"}
+           org.clojure/tools.namespace {:mvn/version "1.1.0"}}
+
+ :aliases {:dev  {:extra-paths ["src/test" "src/dev"]
                   :extra-deps  {expound/expound             {:mvn/version "0.8.9"}
                                 org.clojure/tools.namespace {:mvn/version "1.1.0"}}}
            :clj-tests {:extra-paths ["src/test"]

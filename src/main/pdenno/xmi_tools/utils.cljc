@@ -48,21 +48,45 @@
         (coll? form)     (map  condition-form form)
         :else form))
 
-;;; POD ToDo: Spec about this?
+;;; #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :model/URI}
 (defn storable?
-  "Return true if the argument contains no nils.
+  "Check that the object
+   (1) is not nil,
+   (2) if it is a map, that the values of all keys are conforming.
+   (3) if it is a collection, that all of its
    Such data cannot be stored in datahike."
-  [obj]
-  (let [ok? (atom true)]
-    (letfn [(storable-aux [obj]
+  [obj db-schema]
+  (let [ok? (atom true)
+        db-map (zipmap (map :db/ident db-schema) db-schema)]
+    (letfn [(val-ok? [v typ]
+              (cond (= typ :db.type/string)  (string?  v),
+                    (= typ :db.type/boolean) (boolean? v),
+                    (= typ :db.type/keyword) (keyword? v),
+                    (= typ :db.type/ref)     (map?     v),
+                    (#{:db.type/bigdec :db.type/bigint :db.type/double :db.type/float :db.type/long :db.type/number} typ) (number? v),
+                    :else true)) ; POD I grow weary. 
+            (valid-val? [k v]
+              (if-let [spec (get db-map k)]
+                (or (and (case (:db/cardinality spec)
+                           :db.cardinality/one  (not (coll? v))
+                           :db.cardinality/many (vector? v))
+                         (if (= (:db/cardinality spec) :db.cardinality/many)
+                           (every? #(val-ok? % (:db/valueType spec)) v)
+                           (val-ok? v (:db/valueType spec))))
+                    (log/error "Expected a value conforming to" spec "\n got" (subs (str v) 0 100) "..."))
+                (log/error (subs (str v) 0 100) "...is not a schema type.")))
+            (storable-aux [obj]
               (cond (not @ok?) false
                     (nil? obj) (reset! ok? false)
-                    (map? obj) (reset! ok? (reduce-kv (fn [result _ v] (cond (not @ok?) false
+                    (map? obj) (reset! ok? (reduce-kv (fn [result k v] (cond (not @ok?) false
                                                                              (not result) false
                                                                              (nil? v) false
-                                                                             :else (storable-aux v)))
+                                                                             :else
+                                                                             (and (valid-val? k v) 
+                                                                                  (storable-aux v))))
                                                       true
                                                       obj))
+                    ;; POD should I be checking the types of values here, rather than the :else true? 
                     (coll? obj) (reset! ok? (every? storable-aux obj))
                     :else true))]
       (storable-aux obj))
@@ -200,14 +224,6 @@
                             ?r
                             (:xml/attrs obj)))))
 
-#_(defn read-xml
-  "Return a map of the XML file read."
-  [pathname]
-  (let [xml (-> pathname io/reader x/parse)]
-     {:xml/ns-info (explicit-root-ns (x/element-nss xml))
-      :xml/content (-> xml alienate-xml clean-whitespace detagify vector)
-      :schema/pathname pathname}))
-
 (defn read-xml
   "Return a map of the XML file read."
   [pathname]
@@ -261,24 +277,13 @@
   [content & path-in]
   (xpath-internal content {} path-in))
 
-;;; POD "UML" in the following needs to be a short-name for the schema. 
-(defn mofize 
-  "Turn the xml-looking obj into a map that has MOF characteristics." ; POD comment needs work!
-  [obj]
-  (if (not (map? obj))
-    obj
-    (as-> obj ?o
-      (if (contains? ?o :xml/tag)     (assoc ?o :uml/property (:xml/tag obj))     ?o)
-      (if (contains? ?o :xml/attrs)   (reduce-kv (fn [m k v] (assoc m k v)) ?o (:xml/attrs ?o)) ?o)
-      (if (contains? ?o :xml/content) (assoc ?o :uml/content (mapv mofize (:xml/content ?o))) ?o)
-      (dissoc ?o :xml/content :xml/tag :xml/attrs))))
-
-(defn tryme []
-  (-> (read-xml "resources/test-files/model3-with-profile.xml")
-      (update :xml/content prune-xmi-extensions)
-      (dissoc :xml/ns-info)
-      (xpath  :xmi/XMI :uml/Model)
-      mofize))
+;(read-clean "resources/test-files/model3-with-profile.xml")
+(defn read-clean [file]
+  (as-> (read-xml file) ?x
+      (update ?x :xml/content prune-xmi-extensions)
+      (dissoc ?x :xml/ns-info)
+      (or (xpath ?x :xmi/XMI :uml/Model)       ; M1, typically.
+          (xpath ?x :xmi/XMI :uml/Package))))  ; M2, typically. 
 
 
 (defn parse-xml-string
