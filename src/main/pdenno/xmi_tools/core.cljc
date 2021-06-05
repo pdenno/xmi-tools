@@ -1,5 +1,5 @@
-(ns pdenno.xmi-tools.core
-  "Parse XMI."
+(ns pdenno.xmi-tools.core ; POD maybe a better name would be uml_mm. 
+  "Parse XMI for a UML metamodel." 
   (:refer-clojure :exclude [slurp])
   (:require
    [clojure.string         :as str]
@@ -137,6 +137,92 @@
         (swap! bad-file-on-rebuild? conj path)
         (log/error "Error checking storable?" path ":" e)))))
 
+(defn get-model
+  "Return the map stored in the database for the given schema-urn. Useful in development."
+  [shortname & {:keys [resolve? filter-set] :or {resolve? true filter-set #{:doc/doc-string}}}] ; <=== POD no doc/doc-string in this model. 
+  (when-let [ent  (d/q `[:find ?ent .
+                         :where [?ent :model/name ~shortname]] @conn)]
+    (cond-> (dp/pull @conn '[*] ent)
+      resolve? (util/resolve-db-id conn filter-set))))
+
+(defn class-ent
+  "Return the :db/id of the named class."
+  [class-name conn]
+  (d/q `[:find ?e . :where [?e :xmi/type "uml:Class"] [?e :mof/name ~class-name]] @conn))
+
+(defn class-attr-ents
+  "Return a vector of the :db/id of the named class."
+  [class-ent conn]
+  (d/q `[:find [?e ...] :where
+         [~class-ent :meta/content ?e]
+         [?e :meta/property :ownedAttribute]]
+       @conn))
+
+(defn attr-name
+  "Return the name (a string) of the attr given its :db/id."
+  [attr-ent conn]
+  (d/q `[:find ?t . :where [~attr-ent :mof/name ?t]]
+       @conn))
+
+(defn attr-type
+  "Return the type (a string) of the attr given its :db/id."
+  [attr-ent conn]
+  (d/q `[:find ?t . :where [~attr-ent :mof/type ?t]]
+       @conn))
+
+(defn attr-association
+  "Return the assocation (a string) of the attr given its :db/id."
+  [attr-ent conn]
+  (d/q `[:find ?t . :where [~attr-ent :mof/association ?t]]
+       @conn))
+
+(defn attr-multiplicity
+  "Return a map about the upper multiplicity of the attr given its :db/id."
+  [attr-ent conn upper-lower?] ; POD spec #{:upperValue :lowerValue}. 
+  (let [upper-cnt (d/q `[:find ?cnt . :where 
+                         [~attr-ent :meta/content ?cnt]
+                         [?cnt      :meta/property ~upper-lower?]]  @conn)
+        upper-val (d/q `[:find ?v . :where
+                         [~upper-cnt :mof/value ?v]] @conn)
+        upper-type (d/q `[:find ?t . :where
+                          [~upper-cnt :xmi/type ?t]] @conn)]
+    (cond-> {}
+      upper-val  (assoc :value upper-val)
+      upper-type (assoc :type upper-type))))
+
+(defn ent-comments
+  "Return a vector of the comments on an object."
+  [ent conn]
+  (d/q `[:find [?c ...] :where
+         [~ent  :meta/content ?cnt]
+         [?cnt  :meta/property :ownedComment]
+         [?cnt  :meta/content ?cnt2]
+         [?cnt2 :meta/string-content ?c]]
+       @conn))
+
+;;; ToDo attribute subsetting, composite, opposite. readonly, derived, derived-union
+;;; It would be good to be able to default things in d/q. Possible? ...No. I don't think so. 
+(defn construct-attr
+  "Given an attribute :db/id, return all information about the attribute as a map."
+    [attr-ent conn]
+  (as-> {:attr/name (attr-name attr-ent conn)} ?a
+    (assoc ?a :attr/ownedComment (apply str (ent-comments attr-ent conn)))
+    (assoc ?a :attr/type (attr-type attr-ent conn))
+    (assoc ?a :attr/multiplicity {:attr/lowerValue (attr-multiplicity attr-ent conn :lowerValue)
+                                  :attr/upperValue (attr-multiplicity attr-ent conn :upperValue)})))
+
+(defn construct-class
+  "Given a class name, return all information about the class as a map."
+  [class-name conn]
+  (let [class-ent (class-ent class-name conn)
+        attr-ents (class-attr-ents class-ent conn)]
+    (as-> {:class/name class-name} ?c
+      (assoc ?c :class/ownedComment (apply str (ent-comments class-ent conn)))
+      (assoc ?c :class/ownedAttribute (->> (map #(construct-attr % conn) attr-ents)
+                                           (sort-by :attr/name)
+                                           vec)))))
+
+
 (defn refresh-conn [] (alter-var-root (var conn) (fn [_] (d/connect db-cfg))))
 
 ;;;================================ Starting and Stopping ===========================================
@@ -146,7 +232,7 @@
   "Create the database if :rebuild? is true, otherwise just set the connection atom, conn."
   []
   (cond (:rebuild-db? db-cfg)
-        (binding [log/*config* (assoc log/*config* :min-level :error)] ; Was :info. 
+        (binding [log/*config* (assoc log/*config* :min-level :info)]
           (reset! bad-file-on-rebuild? #{})
           (when (d/database-exists? db-cfg) (d/delete-database db-cfg))
           (d/create-database db-cfg)

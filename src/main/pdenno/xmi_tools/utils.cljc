@@ -1,12 +1,15 @@
 (ns pdenno.xmi-tools.utils
   "Utilities for XMI parsing and rewriting."
   (:require
-   [cemerick.url                 :as url]
-   [clojure.data.xml             :as x]
-   [clojure.java.io              :as io]
-   [clojure.string               :as str]
-   [taoensso.timbre              :as log]
-   [clojure.walk                 :as walk]))
+   [cemerick.url          :as url]
+   [clojure.data.xml      :as x]
+   [clojure.java.io       :as io]
+   [clojure.string        :as str]
+   [clojure.walk          :as walk]
+   [datahike.api          :as d]
+   [datahike.pull-api     :as dp]
+   [taoensso.timbre       :as log]))
+
 
 ;;;================================== POD THIS PROBABLY GOES AWAY WHEN I use xmi-tools as a library (borrowed from messge-mapper) ===========================
 
@@ -73,8 +76,10 @@
                          (if (= (:db/cardinality spec) :db.cardinality/many)
                            (every? #(val-ok? % (:db/valueType spec)) v)
                            (val-ok? v (:db/valueType spec))))
-                    (log/error "Expected a value conforming to" spec "\n got" (subs (str v) 0 100) "..."))
-                (log/error (subs (str v) 0 100) "...is not a schema type.")))
+                    (let [s-val (str v)]
+                      (log/error "Expected a value conforming to" spec ".\n Got:"
+                                 (subs s-val 0 (min 100 (dec (count s-val)))) "...")))
+                (log/error k "...is not a schema type.")))
             (storable-aux [obj]
               (cond (not @ok?) false
                     (nil? obj) (reset! ok? false)
@@ -360,3 +365,29 @@
   ([prev chars]
    (let [strs (mapcat (fn [c] (map (fn [s] (str c s)) prev)) chars)]
      (lazy-cat strs (string-permute strs chars)))))
+
+;;;---------------------- These from message-mapper/db_utils.clj -------------------------------------
+
+;;; This seems to cause problems in recursive resolution. (See resolve-db-id)"
+(defn db-ref?
+  "It looks to me that a datahike ref is a map with exactly one key: :db/id."
+  [obj]
+  (and (map? obj) (= [:db/id] (keys obj))))
+
+(defn resolve-db-id
+  "Return the form resolved, possibly removing some properties."
+  ([form conn] (resolve-db-id form conn #{}))
+  ([form conn filter-set]
+   (letfn [(resolve-aux [obj]
+             (cond
+               (db-ref? obj) (let [res (dp/pull @conn '[*] (:db/id obj))]
+                               (if (= res obj) nil (resolve-aux res)))
+               (map? obj) (reduce-kv (fn [m k v] (if (filter-set k) m (assoc m k (resolve-aux v))))
+                                     {}
+                                     obj)
+               (vector? obj)      (mapv resolve-aux obj)
+               (set? obj)    (set (mapv resolve-aux obj))
+               (coll? obj)        (map  resolve-aux obj)
+               :else  obj))]
+     (resolve-aux form))))
+
