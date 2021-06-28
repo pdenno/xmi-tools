@@ -10,7 +10,6 @@
    [datahike.pull-api     :as dp]
    [taoensso.timbre       :as log]))
 
-
 ;;;================================== POD THIS PROBABLY GOES AWAY WHEN I use xmi-tools as a library (borrowed from messge-mapper) ===========================
 
 (defn keywordize
@@ -374,6 +373,7 @@
   [obj]
   (and (map? obj) (= [:db/id] (keys obj))))
 
+;;; (resolve-db-id {:db/id 48836})
 (defn resolve-db-id
   "Return the form resolved, possibly removing some properties."
   ([form conn] (resolve-db-id form conn #{}))
@@ -390,4 +390,9 @@
                (coll? obj)        (map  resolve-aux obj)
                :else  obj))]
      (resolve-aux form))))
+
+;;;============================= These are just for xmi-tools ==============================
+
+
+  
 
