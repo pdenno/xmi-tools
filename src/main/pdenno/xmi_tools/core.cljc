@@ -22,7 +22,7 @@
 ;;; :db/db.cardinality=many means value is a vector of values of some :db.type. Orthogonal to dd.type/ref. 
 (def work-schema
   "Defines the datahike schema for this throw-away database used to construct a MOF-based model. 
-   The following are only the ones that aren't learned from the schema. (See update-mof-keys)."
+   The following are only the ones that aren't learned from the schema. (See find-mof-keys)."
   [#:db{:cardinality :db.cardinality/one,  :valueType :db.type/keyword, :ident :meta/property}
    #:db{:cardinality :db.cardinality/many, :valueType :db.type/ref,     :ident :meta/content}
    #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :meta/string-content}
@@ -76,47 +76,22 @@
           (if (contains? ?o :xml/content) (assoc ?o :meta/content (mapv deXML-ize (:xml/content ?o))) ?o)
           (dissoc ?o :xml/content :xml/tag :xml/attrs))))
 
-(defn find-mof-keys
-  "Return a set of the property names that don't have a namespace."
-  [model]
-  (let [mof-keys-atm (atom #{})]
-    (walk/postwalk ; Collect keys that aren't ns-qualified.
-     (fn [x] 
-       (when (map? x) (swap! mof-keys-atm (fn [mk] (into mk (remove namespace (keys x))))))
-       x)
-     model)
-    @mof-keys-atom))
-
-(defn add-mof-keys
-  "We only use ns-qualified keys in DH DBs. The unqualified ones in the working schema
-   at the time this called are MOF concepts. Later some with the same base name will be
-   created specialized to the namespace of each Element that defines it."
-  [model mof-key?]
-  (let [mof-key? (:meta/mof-keys model)]
-    (walk/postwalk
-     (fn [x]
-       (if (map? x)
-         (reduce-kv (fn [m k v]
-                      (if (mof-key? k)
-                        (assoc m (keyword "mof" (name k)) v)
-                        (assoc m k v)))
-                    {}
-                    x)
-         x))
-     model)))
-
 ;;; POD Could probably replace this with specific information:
 ;;; {"isAbstract" {:db.type :db.type/boolean :specific/name <whatever defines isAbstract>}
 ;;; Problem is, the same names property could be defined in more than one place. (Check "name", for example.)
 ;;; On second thought, are these things actually MOF properties? (It seems describing a metamodel would require these!)
 
-(def mof-boolean?  #{:mof/isAbstract :mof/isDerived :mof/isDerivedUnion :mof/isOrdered :mof/isQuery
-                    :mof/isReadOnly :mof/isUnique})
-(def mof-keywordable? #{:mof/aggregation :mof/direction})
-(def mof-resolvable? #{:mof/annotatedElement :mof/association :mof/bodyCondition :mof/constrainedElement
-                       :mof/general :mof/importedPackage :mof/instance :mof/memberEnd :mof/precondition
-                       :mof/redefinedOperation :mof/redefinedProperty :mof/subsettedProperty :mof/type})
-(def mof-other? #{:mof/URI :mof/href :mof/language :mof/name :mof/value})
+;;; The following were found by running util/find-mof-keys. 
+(def mof-boolean?  #{:isAbstract :isDerived :isDerivedUnion :isOrdered :isQuery :isReadOnly :isUnique})
+(def mof-keywordable? #{:aggregation :direction})
+(def mof-resolvable? #{:annotatedElement :association :bodyCondition :constrainedElement
+                       :general :importedPackage :instance :memberEnd :precondition
+                       :redefinedOperation :redefinedProperty :subsettedProperty :type})
+(def mof-other? #{:URI :href :language :name :value})
+(def mof-keys? "This one is just to make the DH DB schema."
+  (reduce (fn [super sub] (into super sub))
+          #{}
+          [mof-boolean? mof-keywordable? mof-resolvable? mof-other?]))
 
 (defn mof-db-schema
   "Return a vector of DH schema entries for the learned MOF db attributes."
@@ -126,16 +101,45 @@
                          (mof-keywordable? x) :db.type/keyword
                          (mof-resolvable? x)  :db.type/ref
                          (mof-other? x)       :db.type/string
-                         :else (log/error "Unknown mof key:" x))]
+                         :else (log/warn "Unknown mof key (1):" x))]
       {:db/cardinality :db.cardinality/one, :db/valueType val-type :db/ident x})))
 
-;;; See comment above. Maybe I could inspect precedence list to know who defines what. 
+;;; This needs to be split up! Things that are mof but not resolvable should be done before writing to DB. <========================================= POD POD POD. 
 (defn resolve-mof-keys
-  "For use prior to storing in DH: Certain MOF properties, identified as keywords in the namespace 'mof',
-  are strings that reference object-type things, others such properties have keyword or boolean values. 
+  "For use AFTER storing in DH: Certain MOF properties, identified as keywords in the namespace 'mof',
+   are strings that reference object-type things, others such properties have keyword or boolean values. 
    This returns a map with the objects resolved to {:db/id <num>} or booleans or keywords."
   [model]
-  :NYI) ;<========================================================================================================================================== POD POD POD POD
+  (walk/postwalk
+   (fn [x]
+     (if (map? x)
+       (reduce-kv (fn [m k v]
+                    (if (not (namespace k))
+                      (let [qk (keyword "mof" (name k))]
+                        (cond (mof-boolean? k)
+                              (let [v (k x)]
+                                    (cond (= v "true")  (assoc m qk true), 
+                                          (= v "false") (assoc m qk false)
+                                          :else (do (log/warn "Expected a Boolean for" k "value is " v) m))),
+                            
+                                (mof-keywordable? k) 
+                                (if (string? v)
+                                  (assoc m qk (keyword v))
+                                  (do (log/warn "Expecetd a keyword string for" k "value is" v) m)),
+                            
+                                (mof-resolvable? k) ; This is why it has to be after!
+                                (if-let [id (mm-find-instance :xmi-id v :db wconn)]
+                                  (assoc m qk {:db/id id})
+                                  (do (log/warn "Could not resolve string's db/id. Value is:" v "Key is:" k) m)),
+                                
+                                (mof-other? k) (assoc m qk v), 
+                                
+                                :else (do (log/warn "Unknown mof key (2):" k) m)))
+                      (assoc m k v)))
+                  {}
+                  x)
+       x))
+   model))
 
 ;;; POD Revisit the problem described in the defn doc string. This won't be a problem with a working DB
 ;;;     that is fresh for each MM. 
@@ -157,9 +161,8 @@
   [& {:keys [path shortname]}]
   (as-> (util/read-clean path) ?m
     (deXML-ize ?m)
-    (assoc ?m :meta/mof-keys (find-mof-keys ?m))
-    (add-mof-keys ?m)
-    (resolve-mof-keys ?m)
+    #_(add-mof-keys ?m)
+    (resolve-mof-keys ?m) ;<================================================================= no. no. no. AFTER you've stored it! Update the object. Maybe I should always use :mof/<key> ???
     #_(update-xmi-id ?m shortname))) ; POD This can probably wait until the permanent DB!
 
 ;;; (add-work-file :path "resources/schema/uml-2.4.1.xmi" :shortname "uml241")
@@ -167,13 +170,12 @@
   "Throw schema into a temporary DB used for construct MOF-based metaobjectfor reconstruction."
   [& {:keys [path shortname] :or {path "resources/schema/uml-2.4.1.xmi" shortname "uml241"}}]
   (let [model (xml2mofy :path path :shortname shortname)
-        db-schema (into work-schema (mof-db-schema (:meta/mof-keys model))) 
+        db-schema (into work-schema (mof-db-schema mof-keys?)) 
         db-content [{:model/name shortname
                      :model/type (:meta/property model)
                      :model/id   (:xmi/id model)
-                     :model/URI  (:mof/URI model)
-                     :model/content (:meta/content model)
-                     :meta/mof-keys (vec (:meta/mof-keys model))}]]
+                     :model/URI  (:mof/URI model) ; not :mof/URI yet. 
+                     :model/content (:meta/content model)}]]
     (try
       (if (util/storable? db-content db-schema)
         (try

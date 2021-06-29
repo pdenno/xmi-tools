@@ -393,6 +393,19 @@
 
 ;;;============================= These are just for xmi-tools ==============================
 
+;;; This just for debugging. 
+(defn find-mof-keys
+  "Return a set of the property name keywords that don't have a namespace."
+  [model]
+  (let [mof-keys-atm (atom #{})]
+    (walk/postwalk ; Collect keys that aren't ns-qualified.
+     (fn [x] 
+       (when (map? x) (swap! mof-keys-atm (fn [mk] (into mk (remove namespace (keys x)))))) ; side-effect.
+       x)
+     model)
+    (reset! diag @mof-keys-atm)
+    @mof-keys-atm))
+
 
   
 
