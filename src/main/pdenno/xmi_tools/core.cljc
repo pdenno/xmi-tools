@@ -8,31 +8,46 @@
    [datahike.pull-api      :as dp]
    [malli.core             :as m]
    [mount.core             :refer [defstate]]
-   [pdenno.xmi-tools.utils :as util]
+   [pdenno.xmi-tools.utils :as util :refer [qconnect]]
    [taoensso.timbre        :as log]))
 
-(def db-cfg {:store {:backend :mem, :id "working-db"}, #_{:backend :file :path "resources/database"}
-             :rebuild-db? true
+(def db-cfg {:store {:backend :mem, :id "working-db"}, ; :id could be "uml25" if things are too slow.
+             :mine/rebuild-db? true
+             :keep-history? false
              :schema-flexibility :write})
 
+#_(def db-cfg {:store {:backend :file :path "resources/database"}
+             :mine/rebuild-db? true
+             :schema-flexibility :write})
+
+
 (def diag (atom nil))
-(defonce wconn nil) ; "The connection to the database"
 (defonce bad-file-on-rebuild? (atom #{})) ; For debugging
 
 ;;; :db/db.cardinality=many means value is a vector of values of some :db.type. Orthogonal to dd.type/ref. 
 (def work-schema
   "Defines the datahike schema for this throw-away database used to construct a MOF-based model. 
    The following are only the ones that aren't learned from the schema. (See find-mof-keys)."
-  [#:db{:cardinality :db.cardinality/one,  :valueType :db.type/keyword, :ident :meta/property}
-   #:db{:cardinality :db.cardinality/many, :valueType :db.type/ref,     :ident :meta/content}
+  [#:db{:cardinality :db.cardinality/many, :valueType :db.type/ref,     :ident :meta/content}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/ref,     :ident :meta/owner} ; Owner in XML sense. 
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/keyword, :ident :meta/property}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :meta/shortname} ; Only the model has this. (e.g. "uml25")  
    #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :meta/string-content}
-   #:db{:cardinality :db.cardinality/many, :valueType :db.type/keyword, :ident :meta/mof-keys}
 
-   #:db{:cardinality :db.cardinality/many, :valueType :db.type/ref,     :ident :model/content}
-   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :model/id}   
-   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :model/name}
-   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/keyword, :ident :model/type}
-   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :model/URI}
+   ;; These will be retracted and replaced with :db/id
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/annotatedElement}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/association}   
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/bodyCondition}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/constrainedElement}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/general}   
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/importedPackage}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/instance}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/memberEnd}   
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/precondition}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/redefinedOperation}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/redefinedProperty}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/subsettedProperty}
+   #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :temp/type}
 
    #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :xmi/type}
    #:db{:cardinality :db.cardinality/one,  :valueType :db.type/string,  :ident :xmi/id :unique :db.unique/identity}])
@@ -43,20 +58,21 @@
   "Find an instance (in the working schema?) using one any of the means provided by the keyword args:
          all? - return a vector of all matching if true. 
          type - a string naming a type
-         name - the name of the object, for example, if :type-name 'uml:Class' then 'NamedElement' etc.
-         db - the db-connection, defaults to atom on var wconn.
+         xmi-id - the xmi-id from the XMI file. 
+         name - the name of the object, (might just be for NamedElement???). 
          predicate - first found where it is true  (NYI)
 
   Returns the db-id of the object."
-  [& {:keys [predicate type xmi-id name model db model db all?] :or {db wconn}}]
-  (let [v '?e
+  [& {:keys [predicate type xmi-id name model model all?]}]
+  (let [conn (qconnect db-cfg)
+        v '?e
         qvar (if all? (vector (vector v '...)) (vector v '.))]
     (cond (and type xmi-id)
-          (d/q `[:find ~@qvar :where [~v :xmi/type ~type] [~v :xmi/id ~xmi-id]] @db),
+          (d/q `[:find ~@qvar :where [~v :xmi/type ~type] [~v :xmi/id ~xmi-id]] @conn),
           xmi-id
-          (d/q `[:find ~@qvar :where [~v :xmi/id ~xmi-id]] @db),
+          (d/q `[:find ~@qvar :where [~v :xmi/id ~xmi-id]] @conn),
           type
-          (d/q `[:find ~@qvar :where [~v :xmi/type ~type]] @db))))
+          (d/q `[:find ~@qvar :where [~v :xmi/type ~type]] @conn))))
 
 (defn deXML-ize
   "Turn the xml-looking obj into a map that has MOF characteristics."
@@ -78,8 +94,7 @@
 
 ;;; POD Could probably replace this with specific information:
 ;;; {"isAbstract" {:db.type :db.type/boolean :specific/name <whatever defines isAbstract>}
-;;; Problem is, the same names property could be defined in more than one place. (Check "name", for example.)
-;;; On second thought, are these things actually MOF properties? (It seems describing a metamodel would require these!)
+;;; Are these things actually MOF properties? (It seems describing a metamodel would require these!)
 
 ;;; The following were found by running util/find-mof-keys. 
 (def mof-boolean?  #{:isAbstract :isDerived :isDerivedUnion :isOrdered :isQuery :isReadOnly :isUnique})
@@ -92,6 +107,14 @@
   (reduce (fn [super sub] (into super sub))
           #{}
           [mof-boolean? mof-keywordable? mof-resolvable? mof-other?]))
+(def mof-temp-resolvable?
+  "These are attributes with string values. The attribute will be retracted and replaced with a db/id."
+  (reduce (fn [s v] (conj s (keyword "temp" (name v)))) #{} mof-resolvable?))
+
+;;; "A_attribute_classifier-classifier A_ownedAttribute_structuredClassifier-structuredClassifier NamedElement-namespace"
+(def mof-temp-resolvable-special?
+  "These have string values with multiple (2 or 3?) components separated by spaces; the '-' matters too!"
+  #{:temp/redefinedProperty :temp/redefinedOperation :temp/constrainedElement :temp/memberEnd :temp/subsettedProperty})
 
 (defn mof-db-schema
   "Return a vector of DH schema entries for the learned MOF db attributes."
@@ -102,11 +125,10 @@
                          (mof-resolvable? x)  :db.type/ref
                          (mof-other? x)       :db.type/string
                          :else (log/warn "Unknown mof key (1):" x))]
-      {:db/cardinality :db.cardinality/one, :db/valueType val-type :db/ident x})))
+      {:db/cardinality :db.cardinality/one, :db/valueType val-type :db/ident (keyword "mof" (name x))})))
 
-;;; This needs to be split up! Things that are mof but not resolvable should be done before writing to DB. <========================================= POD POD POD. 
-(defn resolve-mof-keys
-  "For use AFTER storing in DH: Certain MOF properties, identified as keywords in the namespace 'mof',
+(defn coerce-mof-vals
+  "For use BEFORE storing in DH: Certain MOF properties, identified as keywords in the namespace 'mof',
    are strings that reference object-type things, others such properties have keyword or boolean values. 
    This returns a map with the objects resolved to {:db/id <num>} or booleans or keywords."
   [model]
@@ -127,10 +149,8 @@
                                   (assoc m qk (keyword v))
                                   (do (log/warn "Expecetd a keyword string for" k "value is" v) m)),
                             
-                                (mof-resolvable? k) ; This is why it has to be after!
-                                (if-let [id (mm-find-instance :xmi-id v :db wconn)]
-                                  (assoc m qk {:db/id id})
-                                  (do (log/warn "Could not resolve string's db/id. Value is:" v "Key is:" k) m)),
+                                (mof-resolvable? k) ; These temp ones will be retracted and replaced with refs. 
+                                (assoc m (keyword "temp" (name k)) v)
                                 
                                 (mof-other? k) (assoc m qk v), 
                                 
@@ -141,6 +161,29 @@
        x))
    model))
 
+(defn resolve-mof-refs!
+  "For use AFTER storing in DH: replace :temp/<whatever> strings with the :db/id to which they refer."
+  []
+  (binding [log/*config* (assoc log/*config* :min-level :info)]
+    (let [conn (qconnect db-cfg)]
+      (doseq [prop mof-temp-resolvable? ; Choice of key names matters! Can produce a bug!
+              ent-val (d/q `[:find ?e ?v :keys mm/ee mm/vv :where [?e ~prop ?v]] @conn)]
+        (when-not (mof-temp-resolvable-special? prop)
+          (if-let [ref (d/q `[:find ?e . :where [?e :xmi/id ~(:mm/vv ent-val)]] @conn)]
+            (d/transact conn [[:db.fn/retractAttribute (:mm/ee ent-val) prop]
+                              [:db/add (:mm/ee ent-val) (keyword "mof" (name prop)) ref]])
+            (log/warn "Could not find reference for" ent-val "property =" prop)))))))
+    
+(defn set-owner!
+  "Set the owning entity (in the XMI sense), :mof/owner in the DB."
+  []
+  (binding [log/*config* (assoc log/*config* :min-level :info)]
+    (let [conn (qconnect db-cfg)]
+      (doseq [xmi-obj (d/q '[:find [?e ...] :where [?e :xmi/id _]] @conn)]
+        (if-let [owner (d/q `[:find ?e . :where [?e :meta/content ~xmi-obj]] @conn)]
+          (d/transact conn [[:db/add xmi-obj :meta/owner owner]])
+          (log/info "Does not have an owner (Probably top level):" xmi-obj))))))
+  
 ;;; POD Revisit the problem described in the defn doc string. This won't be a problem with a working DB
 ;;;     that is fresh for each MM. 
 (defn update-xmi-id
@@ -154,33 +197,28 @@
        x))
    model))
 
-;;; (xml2mofy :path "resources/schema/uml-2.4.1.xmi" :shortname "uml241")
+;;; (xml2mofy :path "resources/schema/uml25-validator-verbatim.xmi" :shortname "uml25")
 (defn xml2mofy
   "Read and process file to something that can be temporarily stored in DH for
    subsequent generation of the metamodel."
-  [& {:keys [path shortname]}]
+  [& {:keys [path]}]
   (as-> (util/read-clean path) ?m
     (deXML-ize ?m)
-    #_(add-mof-keys ?m)
-    (resolve-mof-keys ?m) ;<================================================================= no. no. no. AFTER you've stored it! Update the object. Maybe I should always use :mof/<key> ???
-    #_(update-xmi-id ?m shortname))) ; POD This can probably wait until the permanent DB!
+    (coerce-mof-vals ?m)))
 
-;;; (add-work-file :path "resources/schema/uml-2.4.1.xmi" :shortname "uml241")
-(defn add-work-file
+;;; (add-metamodel :path "resources/schema/uml25-validator-verbatim.xmi" :shortname "uml25")
+(defn add-metamodel
   "Throw schema into a temporary DB used for construct MOF-based metaobjectfor reconstruction."
-  [& {:keys [path shortname] :or {path "resources/schema/uml-2.4.1.xmi" shortname "uml241"}}]
-  (let [model (xml2mofy :path path :shortname shortname)
+  [& {:keys [path shortname]}]
+  (let [conn (qconnect db-cfg)
+        model (-> (xml2mofy :path path) (assoc :meta/shortname shortname))
         db-schema (into work-schema (mof-db-schema mof-keys?)) 
-        db-content [{:model/name shortname
-                     :model/type (:meta/property model)
-                     :model/id   (:xmi/id model)
-                     :model/URI  (:mof/URI model) ; not :mof/URI yet. 
-                     :model/content (:meta/content model)}]]
+        db-content (vector model)]
     (try
       (if (util/storable? db-content db-schema)
         (try
-          (d/transact wconn db-schema)  ; transact the schema; part of it is learned. 
-          (d/transact wconn db-content) ; Use d/transact here, not transact! which uses a future.
+          (d/transact conn db-schema)  ; transact the schema; part of it is learned. 
+          (d/transact conn db-content) ; Use d/transact here, not transact! which uses a future.
              (catch Exception e
                (swap! bad-file-on-rebuild? conj path)
                (log/error "Error adding" path ":" (-> e str (subs 0 200)))))
@@ -191,122 +229,129 @@
         (swap! bad-file-on-rebuild? conj path)
         (log/error "Error checking storable?" path ":" e)))))
 
-;;; (get-model "uml241" wconn)
+;;; (get-model "uml25")
 (defn get-model
   "Return the map stored in the database for the given schema-urn. Useful in development."
-  [shortname wconn & {:keys [resolve? filter-set] :or {resolve? true filter-set #{}}}]
-  (when-let [ent  (d/q `[:find ?ent .
-                         :where [?ent :model/name ~shortname]] @wconn)]
-    (cond-> (dp/pull @wconn '[*] ent)
-      resolve? (util/resolve-db-id wconn filter-set))))
+  [shortname]
+  (let [[ent typ] (d/q `[:find [?e ?t] :where 
+                         [?e :meta/shortname ~shortname]
+                         [?e :xmi/type ?t]] @(qconnect db-cfg))]
+    {:type typ :id ent}))
+
+;;;; This is WIP. Too slow! Use dp/pull !
+(defn get-object
+  "Create a map about the object that goes only one step deeper."
+  [id & {:keys [just-name?]}]
+  (let [conn (qconnect db-cfg)
+        typ (d/q `[:find ?t . :where  [~id :xmi/type ?t]] @conn)
+        nam (d/q `[:find ?n . :where  [~id :mof/name ?n]] @conn)
+        cnt (when-not just-name? (d/q `[:find [?c ...] :where  [?c :meta/owner ~id]] @conn))]
+    (cond-> {:type typ :id id}
+      nam              (assoc :mof/name nam)
+      (not just-name?) (assoc :meta/content (mapv #(get-object % :just-name? true) cnt)))))
 
 (defn class-ent
   "Return the :db/id of the named class."
-  [class-name wconn]
-  (d/q `[:find ?e . :where [?e :xmi/type "uml:Class"] [?e :mof/name ~class-name]] @wconn))
+  [class-name]
+  (d/q `[:find ?e . :where [?e :xmi/type "uml:Class"] [?e :mof/name ~class-name]] @(qconnect db-cfg)))
 
 (defn class-attr-ents
   "Return a vector of the :db/id of the named class."
-  [class-ent wconn]
+  [class-ent]
   (d/q `[:find [?e ...] :where
          [~class-ent :meta/content ?e]
          [?e :meta/property :ownedAttribute]]
-       @wconn))
+       @(qconnect db-cfg)))
 
 (defn attr-name
   "Return the name (a string) of the attr given its :db/id."
-  [attr-ent wconn]
-  (d/q `[:find ?t . :where [~attr-ent :mof/name ?t]]
-       @wconn))
+  [attr-ent]
+  (d/q `[:find ?t . :where [~attr-ent :mof/name ?t]] @(qconnect db-cfg)))
 
 (defn attr-type
   "Return the type (a string) of the attr given its :db/id."
-  [attr-ent wconn]
-  (d/q `[:find ?t . :where [~attr-ent :mof/type ?t]]
-       @wconn))
+  [attr-ent]
+  (d/q `[:find ?t . :where [~attr-ent :mof/type ?t]] @(qconnect db-cfg)))
 
 (defn attr-association
   "Return the assocation (a string) of the attr given its :db/id."
-  [attr-ent wconn]
-  (d/q `[:find ?t . :where [~attr-ent :mof/association ?t]]
-       @wconn))
+  [attr-ent]
+  (d/q `[:find ?t . :where [~attr-ent :mof/association ?t]] @(qconnect db-cfg)))
 
 (defn attr-subsetted
   "Return the type (a string) of the attr given its :db/id."
-  [attr-ent wconn]
-  (d/q `[:find ?p . :where [~attr-ent :mof/subsettedProperty ?p]]
-       @wconn))
+  [attr-ent]
+  (d/q `[:find ?p . :where [~attr-ent :mof/subsettedProperty ?p]] @(qconnect db-cfg)))
 
 
 (defn attr-multiplicity
   "Return a map about the upper multiplicity of the attr given its :db/id."
-  [attr-ent wconn upper-lower?] ; POD spec #{:upperValue :lowerValue}. 
-  (let [content (d/q `[:find ?cnt . :where 
+  [attr-ent upper-lower?] ; POD spec #{:upperValue :lowerValue}. 
+  (let [conn (qconnect db-cfg)
+        content (d/q `[:find ?cnt . :where 
                          [~attr-ent :meta/content ?cnt]
-                         [?cnt      :meta/property ~upper-lower?]]  @wconn)
+                         [?cnt      :meta/property ~upper-lower?]]  @conn)
         val (d/q `[:find ?v . :where
-                         [~content :mof/value ?v]] @wconn)
+                         [~content :mof/value ?v]] @conn)
         type (d/q `[:find ?t . :where
-                          [~content :xmi/type ?t]] @wconn)]
+                          [~content :xmi/type ?t]] @conn)]
     (cond-> {}
       val  (assoc :value val)
       type (assoc :type  type))))
 
 (defn ent-comments
   "Return a vector of the comments on an object."
-  [ent wconn]
+  [ent]
   (d/q `[:find [?c ...] :where
          [~ent  :meta/content ?cnt]
          [?cnt  :meta/property :ownedComment]
          [?cnt  :meta/content ?cnt2]
          [?cnt2 :meta/string-content ?c]]
-       @wconn))
+       @(qconnect db-cfg)))
 
 ;;; ==================> ToDo attribute composite, opposite. readonly, derived, derived-union <======================
 ;;; It would be good to be able to default things in d/q. Possible? ...No, I don't think so. 
 (defn construct-attr
   "Given an attribute :db/id, return all information about the attribute as a map."
-  [attr-ent wconn]
-  (let [typ (attr-type attr-ent wconn)
-        subsetted (attr-subsetted attr-ent wconn)]
-    (as-> {:attr/name (attr-name attr-ent wconn)} ?a
-      (assoc ?a :attr/ownedComment (apply str (ent-comments attr-ent wconn)))
+  [attr-ent]
+  (let [typ (attr-type attr-ent)
+        subsetted (attr-subsetted attr-ent)]
+    (as-> {:attr/name (attr-name attr-ent)} ?a
+      (assoc ?a :attr/ownedComment (apply str (ent-comments attr-ent)))
       (if typ (assoc ?a :attr/type typ) ?a)
       (if subsetted (assoc ?a :attr/subsets subsetted) ?a)
-      (assoc ?a :attr/multiplicity {:attr/lowerValue (attr-multiplicity attr-ent wconn :lowerValue)
-                                    :attr/upperValue (attr-multiplicity attr-ent wconn :upperValue)}))))
+      (assoc ?a :attr/multiplicity {:attr/lowerValue (attr-multiplicity attr-ent :lowerValue)
+                                    :attr/upperValue (attr-multiplicity attr-ent :upperValue)}))))
 
 (defn construct-class
   "Given a class name, return all information about the class as a map."
-  [class-name wconn]
-  (let [class-ent (class-ent class-name wconn)
-        attr-ents (class-attr-ents class-ent wconn)]
+  [class-name]
+  (let [class-ent (class-ent class-name)
+        attr-ents (class-attr-ents class-ent)]
     (as-> {:class/name class-name} ?c
-      (assoc ?c :class/ownedComment (apply str (ent-comments class-ent wconn)))
-      (assoc ?c :class/ownedAttribute (->> (map #(construct-attr % wconn) attr-ents)
+      (assoc ?c :class/ownedComment (apply str (ent-comments class-ent)))
+      (assoc ?c :class/ownedAttribute (->> (map construct-attr attr-ents)
                                            (sort-by :attr/name)
                                            vec)))))
-
-
-(defn refresh-conn [] (alter-var-root (var wconn) (fn [_] (d/connect db-cfg))))
 
 ;;;================================ Starting and Stopping ===========================================
 ;;; (user/restart) whenever you update the DB or the resolvers. (tools/refresh) if compilation fails.
 
 (defn create-db!
-  "Create the database if :rebuild? is true, otherwise just set the connection atom, wconn."
+  "Create the database if :rebuild? is true."
   []
-  (cond (:rebuild-db? db-cfg)
-        (binding [log/*config* (assoc log/*config* :min-level :info)]
-          (reset! bad-file-on-rebuild? #{})
-          (when (d/database-exists? db-cfg) (d/delete-database db-cfg))
-          (d/create-database db-cfg)
-          (alter-var-root (var wconn) (fn [_] (d/connect db-cfg)))
-          #_(add-work-file :path "resources/schema/uml-2.4.1.xmi" :shortname "uml241")
-          (add-work-file :path "resources/schema/uml25-validator-verbatim.xmi" :shortname "uml25")
-          (log/info "Created schema DB")),
-        (d/database-exists? db-cfg) (alter-var-root (var wconn) (fn [_] (d/connect db-cfg))),
-        :else (log/warn "There is no DB to connect to.")))
+  (when (:mine/rebuild-db? db-cfg)
+    (binding [log/*config* (assoc log/*config* :min-level :info)]
+      (reset! bad-file-on-rebuild? #{})
+      (when (d/database-exists? db-cfg) (d/delete-database db-cfg))
+      (d/create-database db-cfg)
+      (log/info "Starting DB rebuild")
+      #_(add-metamodel :path "resources/schema/uml-2.4.1.xmi" :shortname "uml241")
+      (add-metamodel :path "resources/schema/uml25-validator-verbatim.xmi" :shortname "uml25")
+      (resolve-mof-refs!)
+      (set-owner!)
+      (log/info "Ending DB rebuild (except for futures)")      
+      (log/info "Created schema DB"))))
 
 (defstate core
   :start

@@ -374,22 +374,24 @@
   (and (map? obj) (= [:db/id] (keys obj))))
 
 ;;; (resolve-db-id {:db/id 48836})
-(defn resolve-db-id
+;;; This isn't useful here because models have cycles!
+#_(defn resolve-db-id
   "Return the form resolved, possibly removing some properties."
-  ([form conn] (resolve-db-id form conn #{}))
-  ([form conn filter-set]
-   (letfn [(resolve-aux [obj]
-             (cond
-               (db-ref? obj) (let [res (dp/pull @conn '[*] (:db/id obj))]
-                               (if (= res obj) nil (resolve-aux res)))
-               (map? obj) (reduce-kv (fn [m k v] (if (filter-set k) m (assoc m k (resolve-aux v))))
-                                     {}
-                                     obj)
-               (vector? obj)      (mapv resolve-aux obj)
-               (set? obj)    (set (mapv resolve-aux obj))
-               (coll? obj)        (map  resolve-aux obj)
-               :else  obj))]
-     (resolve-aux form))))
+  ([form db-cfg] (resolve-db-id form db-cfg #{}))
+  ([form db-cfg filter-set]
+   (let [conn (d/connect db-cfg)]
+     (letfn [(resolve-aux [obj]
+               (cond
+                 (db-ref? obj) (let [res (dp/pull @conn '[*] (:db/id obj))]
+                                 (if (= res obj) nil (resolve-aux res)))
+                 (map? obj) (reduce-kv (fn [m k v] (if (filter-set k) m (assoc m k (resolve-aux v))))
+                                       {}
+                                       obj)
+                 (vector? obj)      (mapv resolve-aux obj)
+                 (set? obj)    (set (mapv resolve-aux obj))
+                 (coll? obj)        (map  resolve-aux obj)
+                 :else  obj))]
+       (resolve-aux form)))))
 
 ;;;============================= These are just for xmi-tools ==============================
 
@@ -403,9 +405,11 @@
        (when (map? x) (swap! mof-keys-atm (fn [mk] (into mk (remove namespace (keys x)))))) ; side-effect.
        x)
      model)
-    (reset! diag @mof-keys-atm)
     @mof-keys-atm))
 
-
-  
+(defn qconnect
+  "Like d/connect but without the logging noise!"
+  [cfg]
+  (binding [log/*config* (assoc log/*config* :min-level :info)]
+    (d/connect cfg)))
 
