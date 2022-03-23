@@ -20,7 +20,6 @@
              :mine/rebuild-db? true
              :schema-flexibility :write})
 
-
 (def diag (atom nil))
 (defonce bad-file-on-rebuild? (atom #{})) ; For debugging
 
@@ -173,20 +172,21 @@
             (d/transact conn [[:db.fn/retractAttribute (:mm/ee ent-val) prop]
                               [:db/add (:mm/ee ent-val) (keyword "mof" (name prop)) ref]])
             (log/warn "Could not find reference for" ent-val "property =" prop)))))))
-    
+
+;;; POD This takes 4 seconds. Fix it. Use dp/pull. 
 (defn set-owner!
   "Set the owning entity (in the XMI sense), :mof/owner in the DB."
   []
   (binding [log/*config* (assoc log/*config* :min-level :info)]
     (let [conn (qconnect db-cfg)]
-      (doseq [xmi-obj (d/q '[:find [?e ...] :where [?e :xmi/id _]] @conn)]
+      (doseq [xmi-obj (d/q '[:find [?e ...] :where [?e :xmi/id _]] @conn)] ; Then it makes 6715 more d/q !
         (if-let [owner (d/q `[:find ?e . :where [?e :meta/content ~xmi-obj]] @conn)]
           (d/transact conn [[:db/add xmi-obj :meta/owner owner]])
           (log/info "Does not have an owner (Probably top level):" xmi-obj))))))
   
-;;; POD Revisit the problem described in the defn doc string. This won't be a problem with a working DB
-;;;     that is fresh for each MM. 
-(defn update-xmi-id
+;;; POD Revisit the problem described in the defn doc string. 
+;;;     I'm thinking of having separate DBs for each MM. 
+#_(defn update-xmi-id
   "xmi-id of UML specs use computed names that will likely be the same
    from one spec to the next. That's not good for a DH :db.unique/identity."
   [model shortname]
@@ -282,7 +282,6 @@
   "Return the type (a string) of the attr given its :db/id."
   [attr-ent]
   (d/q `[:find ?p . :where [~attr-ent :mof/subsettedProperty ?p]] @(qconnect db-cfg)))
-
 
 (defn attr-multiplicity
   "Return a map about the upper multiplicity of the attr given its :db/id."
